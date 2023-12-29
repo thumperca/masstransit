@@ -1,9 +1,35 @@
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 
-struct Channel<T> {
+struct ChannelInner<T> {
+    lock: AtomicU32,
     data: VecDeque<T>,
 }
 
+impl<T> ChannelInner<T> {
+    fn new() -> Self {
+        Self {
+            lock: AtomicU32::new(0),
+            data: VecDeque::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Channel<T> {
+    inner: Arc<ChannelInner<T>>,
+}
+
+impl<T> Channel<T> {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(ChannelInner::new()),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Sender<T> {
     inner: Channel<T>,
 }
@@ -18,6 +44,7 @@ impl<T> Sender<T> {
     }
 }
 
+#[derive(Clone)]
 pub struct Receiver<T> {
     inner: Channel<T>,
 }
@@ -31,6 +58,12 @@ impl<T> Receiver<T> {
         todo!()
     }
 }
+
+unsafe impl<T> Sync for Sender<T> {}
+unsafe impl<T> Send for Sender<T> {}
+
+unsafe impl<T> Sync for Receiver<T> {}
+unsafe impl<T> Send for Receiver<T> {}
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     todo!()
