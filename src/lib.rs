@@ -35,3 +35,15 @@ impl<T> Receiver<T> {
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     todo!()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_works() {
+        let (tx, rx) = channel();
+        tx.send(101);
+        assert_eq!(rx.recv().unwrap(), 101);
+    }
+}
