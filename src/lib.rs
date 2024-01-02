@@ -84,8 +84,18 @@ impl<T> Sender<T> {
         for item in items {
             lock.push_back(item);
         }
+        let num_items = lock.len();
         drop(lock);
         // wake up waiting thread
+        let mut taken = 0;
+        let mut lock = self.inner.queue.lock().unwrap();
+        while let Some(wt) = lock.pop_front() {
+            taken += wt.count;
+            wt.thread.unpark();
+            if taken >= num_items {
+                break;
+            }
+        }
     }
 }
 
