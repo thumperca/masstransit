@@ -1,17 +1,32 @@
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicU32;
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
+use std::thread::Thread;
+
+struct WaitingThread {
+    thread: Thread,
+    count: usize,
+}
+
+impl WaitingThread {
+    pub fn new(count: usize) -> Self {
+        Self {
+            thread: std::thread::current(),
+            count,
+        }
+    }
+}
 
 struct ChannelInner<T> {
-    lock: AtomicU32,
-    data: VecDeque<T>,
+    queue: Mutex<VecDeque<WaitingThread>>,
+    data: Mutex<VecDeque<T>>,
 }
 
 impl<T> ChannelInner<T> {
     fn new() -> Self {
         Self {
-            lock: AtomicU32::new(0),
-            data: VecDeque::new(),
+            queue: Mutex::new(VecDeque::new()),
+            data: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -29,6 +44,14 @@ impl<T> Channel<T> {
     }
 }
 
+impl<T> Deref for Channel<T> {
+    type Target = Arc<ChannelInner<T>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 #[derive(Clone)]
 pub struct Sender<T> {
     inner: Channel<T>,
@@ -36,11 +59,21 @@ pub struct Sender<T> {
 
 impl<T> Sender<T> {
     pub fn send(&self, item: T) {
-        todo!()
+        // add item to queue
+        let mut lock = self.inner.data.lock().unwrap();
+        lock.push_back(item);
+        drop(lock);
+        // wake up waiting thread
     }
 
-    pub fn bulk_send(&self, items: &[T]) {
-        todo!()
+    pub fn send_many(&self, items: &[T]) {
+        // add item to queue
+        let mut lock = self.inner.data.lock().unwrap();
+        for item in items {
+            lock.push_back(item);
+        }
+        drop(lock);
+        // wake up waiting thread
     }
 }
 
