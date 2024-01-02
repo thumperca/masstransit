@@ -1,10 +1,14 @@
 use std::collections::VecDeque;
 use std::ops::Deref;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::{Arc, Mutex};
 use std::thread::Thread;
 
 struct WaitingThread {
+    // handle to the waiting thread to wake it up
     thread: Thread,
+    // number of items the thread is waiting for
     count: usize,
 }
 
@@ -18,8 +22,12 @@ impl WaitingThread {
 }
 
 struct ChannelInner<T> {
+    // queue of waiting threads
     queue: Mutex<VecDeque<WaitingThread>>,
+    // channel messages
     data: Mutex<VecDeque<T>>,
+    // number of senders to keep track when channel is closed
+    num_senders: AtomicU32,
 }
 
 impl<T> ChannelInner<T> {
@@ -27,6 +35,7 @@ impl<T> ChannelInner<T> {
         Self {
             queue: Mutex::new(VecDeque::new()),
             data: Mutex::new(VecDeque::new()),
+            num_senders: AtomicU32::new(1),
         }
     }
 }
@@ -52,7 +61,6 @@ impl<T> Deref for Channel<T> {
     }
 }
 
-#[derive(Clone)]
 pub struct Sender<T> {
     inner: Channel<T>,
 }
@@ -66,7 +74,7 @@ impl<T> Sender<T> {
         // wake up waiting thread
     }
 
-    pub fn send_many(&self, items: &[T]) {
+    pub fn send_many(&self, items: Vec<T>) {
         // add item to queue
         let mut lock = self.inner.data.lock().unwrap();
         for item in items {
@@ -77,6 +85,22 @@ impl<T> Sender<T> {
     }
 }
 
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        self.inner.num_senders.fetch_add(1, Relaxed);
+        let channel = Channel {
+            inner: self.inner.clone(),
+        };
+        Self { inner: channel }
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        self.inner.num_senders.fetch_sub(1, Release);
+    }
+}
+
 #[derive(Clone)]
 pub struct Receiver<T> {
     inner: Channel<T>,
@@ -84,7 +108,24 @@ pub struct Receiver<T> {
 
 impl<T> Receiver<T> {
     pub fn recv(&self) -> Option<T> {
-        todo!()
+        loop {
+            let mut lock = self.inner.data.lock().unwrap();
+            let pop_result = lock.pop_front();
+            drop(lock);
+            // there's an item in the queue
+            if let Some(item) = pop_result {
+                return Some(item);
+            }
+            // channel is closed
+            if self.inner.num_senders.load(Acquire) == 0 {
+                return None;
+            }
+            // queue is empty
+            let wt = WaitingThread::new(1);
+            let mut lock = self.inner.queue.lock().unwrap();
+            lock.push_back(wt);
+            std::thread::park();
+        }
     }
 
     pub fn recv_exact(&self, num: usize) -> Option<Vec<T>> {
