@@ -72,6 +72,10 @@ impl<T> Sender<T> {
         lock.push_back(item);
         drop(lock);
         // wake up waiting thread
+        let mut lock = self.inner.queue.lock().unwrap();
+        if let Some(wt) = lock.pop_front() {
+            wt.thread.unpark();
+        }
     }
 
     pub fn send_many(&self, items: Vec<T>) {
@@ -124,6 +128,7 @@ impl<T> Receiver<T> {
             let wt = WaitingThread::new(1);
             let mut lock = self.inner.queue.lock().unwrap();
             lock.push_back(wt);
+            drop(lock);
             std::thread::park();
         }
     }
@@ -144,17 +149,45 @@ unsafe impl<T> Sync for Receiver<T> {}
 unsafe impl<T> Send for Receiver<T> {}
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    todo!()
+    let channel = Channel::new();
+    let sender = Sender {
+        inner: Channel {
+            inner: channel.inner.clone(),
+        },
+    };
+    let recv = Receiver { inner: channel };
+    (sender, recv)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn it_works() {
         let (tx, rx) = channel();
         tx.send(101);
         assert_eq!(rx.recv().unwrap(), 101);
+    }
+
+    #[test]
+    fn channel_close() {
+        let (tx, rx) = channel();
+        tx.send(101);
+        assert_eq!(rx.recv().unwrap(), 101);
+        drop(tx);
+        assert!(rx.recv().is_none());
+    }
+
+    #[test]
+    fn wake_up_waiting_thread() {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_micros(100));
+            tx.send(101);
+        });
+        assert_eq!(rx.recv().unwrap(), 101);
+        assert!(rx.recv().is_none());
     }
 }
