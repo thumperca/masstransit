@@ -90,7 +90,11 @@ impl<T> Sender<T> {
         let mut taken = 0;
         let mut lock = self.inner.queue.lock().unwrap();
         while let Some(wt) = lock.pop_front() {
-            taken += wt.count;
+            if wt.count == usize::MAX {
+                taken = usize::MAX;
+            } else {
+                taken += wt.count;
+            }
             wt.thread.unpark();
             if taken >= num_items {
                 break;
@@ -144,11 +148,53 @@ impl<T> Receiver<T> {
     }
 
     pub fn recv_exact(&self, num: usize) -> Option<Vec<T>> {
-        todo!()
+        loop {
+            let mut lock = self.inner.data.lock().unwrap();
+            // there's an item in the queue
+            let mut data = Vec::with_capacity(num);
+            loop {
+                if let Some(item) = lock.pop_front() {
+                    data.push(item);
+                    if data.len() == num {
+                        return Some(data);
+                    }
+                } else if !data.is_empty() {
+                    return Some(data);
+                } else {
+                    break;
+                }
+            }
+            drop(lock);
+            // channel is closed
+            if self.inner.num_senders.load(Acquire) == 0 {
+                return None;
+            }
+            // queue is empty
+            let wt = WaitingThread::new(num);
+            let mut lock = self.inner.queue.lock().unwrap();
+            lock.push_back(wt);
+            drop(lock);
+            std::thread::park();
+        }
     }
 
     pub fn recv_all(&self) -> Option<Vec<T>> {
-        todo!()
+        loop {
+            let mut lock = self.inner.data.lock().unwrap();
+            let data = std::mem::take(&mut *lock);
+            if !data.is_empty() {
+                let data = Vec::from_iter(data.into_iter());
+                return Some(data);
+            } else if self.inner.num_senders.load(Acquire) == 0 {
+                return None;
+            }
+            // wait for messages
+            let wt = WaitingThread::new(usize::MAX);
+            let mut lock = self.inner.queue.lock().unwrap();
+            lock.push_back(wt);
+            drop(lock);
+            std::thread::park();
+        }
     }
 }
 
@@ -199,5 +245,26 @@ mod tests {
         });
         assert_eq!(rx.recv().unwrap(), 101);
         assert!(rx.recv().is_none());
+    }
+
+    #[test]
+    fn recv_exact() {
+        let data = (0..8).collect::<Vec<u16>>();
+        let (tx, rx) = channel();
+        tx.send_many(data);
+        drop(tx);
+        assert_eq!(rx.recv_exact(5).unwrap().len(), 5);
+        assert_eq!(rx.recv_exact(5).unwrap().len(), 3);
+        assert!(rx.recv_exact(5).is_none());
+    }
+
+    #[test]
+    fn recv_all() {
+        let data = (0..8).collect::<Vec<u16>>();
+        let (tx, rx) = channel();
+        tx.send_many(data);
+        drop(tx);
+        assert_eq!(rx.recv_all().unwrap().len(), 8);
+        assert!(rx.recv_all().is_none());
     }
 }
