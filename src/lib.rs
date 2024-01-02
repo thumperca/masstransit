@@ -115,7 +115,12 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.inner.num_senders.fetch_sub(1, Release);
+        if self.inner.num_senders.fetch_sub(1, Release) == 1 {
+            let lock = self.inner.queue.lock().unwrap();
+            for item in lock.iter() {
+                item.thread.unpark();
+            }
+        }
     }
 }
 
