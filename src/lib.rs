@@ -87,7 +87,11 @@ impl<T> Receiver<T> {
         todo!()
     }
 
-    pub fn bulk_recv(&self) -> Option<Vec<T>> {
+    pub fn recv_exact(&self, num: usize) -> Option<Vec<T>> {
+        todo!()
+    }
+
+    pub fn recv_all(&self) -> Option<Vec<T>> {
         todo!()
     }
 }
