@@ -1,10 +1,9 @@
 use atomic_wait::{wait, wake_all, wake_one};
-use std::collections::VecDeque;
+use crossbeam::queue::SegQueue;
 use std::ops::Deref;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::sync::{Arc, Mutex};
-use std::thread::Thread;
+use std::sync::Arc;
 
 struct Counter {
     senders: AtomicU32,
@@ -16,7 +15,7 @@ struct ChannelInner<T> {
     // u32 for threads to wait on
     wait: AtomicU32,
     // channel messages
-    data: Mutex<VecDeque<T>>,
+    data: SegQueue<T>,
     // number of senders to keep track when channel is closed
     counter: Counter,
 }
@@ -25,7 +24,7 @@ impl<T> ChannelInner<T> {
     fn new() -> Self {
         Self {
             wait: AtomicU32::new(0),
-            data: Mutex::new(VecDeque::new()),
+            data: SegQueue::new(),
             counter: Counter {
                 senders: AtomicU32::new(1),
                 receivers: AtomicU32::new(1),
@@ -63,9 +62,7 @@ pub struct Sender<T> {
 impl<T> Sender<T> {
     pub fn send(&self, item: T) {
         // add item to queue
-        let mut lock = self.inner.data.lock().unwrap();
-        lock.push_back(item);
-        drop(lock);
+        self.inner.data.push(item);
         // wake up waiting thread
         self.inner.wait.fetch_add(1, Release);
         if self.inner.counter.waiting.load(Acquire) > 0 {
@@ -75,12 +72,10 @@ impl<T> Sender<T> {
 
     pub fn send_many(&self, items: Vec<T>) {
         // add item to queue
-        let mut lock = self.inner.data.lock().unwrap();
         for item in items {
-            lock.push_back(item);
+            self.inner.data.push(item);
         }
-        let num_items = lock.len();
-        drop(lock);
+        let num_items = self.inner.data.len();
         self.inner.wait.fetch_add(1, Release);
         // wake up waiting thread
         if self.inner.counter.waiting.load(Acquire) > 0 {
@@ -121,11 +116,8 @@ pub struct Receiver<T> {
 impl<T> Receiver<T> {
     pub fn recv(&self) -> Option<T> {
         loop {
-            let mut lock = self.inner.data.lock().unwrap();
-            let pop_result = lock.pop_front();
-            drop(lock);
             // there's an item in the queue
-            if let Some(item) = pop_result {
+            if let Some(item) = self.inner.data.pop() {
                 return Some(item);
             }
             // channel is closed
@@ -142,11 +134,10 @@ impl<T> Receiver<T> {
 
     pub fn recv_exact(&self, num: usize) -> Option<Vec<T>> {
         loop {
-            let mut lock = self.inner.data.lock().unwrap();
             // there's an item in the queue
             let mut data = Vec::with_capacity(num);
             loop {
-                if let Some(item) = lock.pop_front() {
+                if let Some(item) = self.inner.data.pop() {
                     data.push(item);
                     if data.len() == num {
                         return Some(data);
@@ -157,7 +148,6 @@ impl<T> Receiver<T> {
                     break;
                 }
             }
-            drop(lock);
             // channel is closed
             if self.inner.counter.senders.load(Acquire) == 0 {
                 return None;
@@ -171,16 +161,22 @@ impl<T> Receiver<T> {
 
     pub fn recv_all(&self) -> Option<Vec<T>> {
         loop {
-            let mut lock = self.inner.data.lock().unwrap();
-            let data = std::mem::take(&mut *lock);
-            if !data.is_empty() {
-                let data = Vec::from_iter(data.into_iter());
-                return Some(data);
-            } else if self.inner.counter.senders.load(Acquire) == 0 {
+            // there's an item in the queue
+            let mut data = Vec::new();
+            loop {
+                if let Some(item) = self.inner.data.pop() {
+                    data.push(item);
+                } else if !data.is_empty() {
+                    return Some(data);
+                } else {
+                    break;
+                }
+            }
+            // channel is closed
+            if self.inner.counter.senders.load(Acquire) == 0 {
                 return None;
             }
-            drop(lock);
-            // wait for messages
+            // queue is empty
             self.inner.counter.waiting.fetch_add(1, Release);
             wait(&self.inner.wait, self.inner.wait.load(Relaxed));
             self.inner.counter.waiting.fetch_sub(1, Release);
