@@ -1,3 +1,4 @@
+use atomic_wait::{wait, wake_all, wake_one};
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::atomic::AtomicU32;
@@ -5,37 +6,31 @@ use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::{Arc, Mutex};
 use std::thread::Thread;
 
-struct WaitingThread {
-    // handle to the waiting thread to wake it up
-    thread: Thread,
-    // number of items the thread is waiting for
-    count: usize,
-}
-
-impl WaitingThread {
-    pub fn new(count: usize) -> Self {
-        Self {
-            thread: std::thread::current(),
-            count,
-        }
-    }
+struct Counter {
+    senders: AtomicU32,
+    receivers: AtomicU32,
+    waiting: AtomicU32,
 }
 
 struct ChannelInner<T> {
-    // queue of waiting threads
-    queue: Mutex<VecDeque<WaitingThread>>,
+    // u32 for threads to wait on
+    wait: AtomicU32,
     // channel messages
     data: Mutex<VecDeque<T>>,
     // number of senders to keep track when channel is closed
-    num_senders: AtomicU32,
+    counter: Counter,
 }
 
 impl<T> ChannelInner<T> {
     fn new() -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
+            wait: AtomicU32::new(0),
             data: Mutex::new(VecDeque::new()),
-            num_senders: AtomicU32::new(1),
+            counter: Counter {
+                senders: AtomicU32::new(1),
+                receivers: AtomicU32::new(1),
+                waiting: AtomicU32::new(0),
+            },
         }
     }
 }
@@ -72,9 +67,9 @@ impl<T> Sender<T> {
         lock.push_back(item);
         drop(lock);
         // wake up waiting thread
-        let mut lock = self.inner.queue.lock().unwrap();
-        if let Some(wt) = lock.pop_front() {
-            wt.thread.unpark();
+        self.inner.wait.fetch_add(1, Release);
+        if self.inner.counter.waiting.load(Acquire) > 0 {
+            wake_one(&self.inner.wait);
         }
     }
 
@@ -86,18 +81,13 @@ impl<T> Sender<T> {
         }
         let num_items = lock.len();
         drop(lock);
+        self.inner.wait.fetch_add(1, Release);
         // wake up waiting thread
-        let mut taken = 0;
-        let mut lock = self.inner.queue.lock().unwrap();
-        while let Some(wt) = lock.pop_front() {
-            if wt.count == usize::MAX {
-                taken = usize::MAX;
+        if self.inner.counter.waiting.load(Acquire) > 0 {
+            if num_items == 1 {
+                wake_one(&self.inner.wait);
             } else {
-                taken += wt.count;
-            }
-            wt.thread.unpark();
-            if taken >= num_items {
-                break;
+                wake_all(&self.inner.wait);
             }
         }
     }
@@ -105,7 +95,7 @@ impl<T> Sender<T> {
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        self.inner.num_senders.fetch_add(1, Relaxed);
+        self.inner.counter.senders.fetch_add(1, Relaxed);
         let channel = Channel {
             inner: self.inner.clone(),
         };
@@ -115,10 +105,9 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        if self.inner.num_senders.fetch_sub(1, Release) == 1 {
-            let lock = self.inner.queue.lock().unwrap();
-            for item in lock.iter() {
-                item.thread.unpark();
+        if self.inner.counter.senders.fetch_sub(1, Release) == 1 {
+            if self.inner.counter.waiting.load(Acquire) != 0 {
+                wake_all(&self.inner.wait);
             }
         }
     }
@@ -140,15 +129,14 @@ impl<T> Receiver<T> {
                 return Some(item);
             }
             // channel is closed
-            if self.inner.num_senders.load(Acquire) == 0 {
+            let num_senders = self.inner.counter.senders.load(Acquire);
+            if num_senders == 0 {
                 return None;
             }
             // queue is empty
-            let wt = WaitingThread::new(1);
-            let mut lock = self.inner.queue.lock().unwrap();
-            lock.push_back(wt);
-            drop(lock);
-            std::thread::park();
+            self.inner.counter.waiting.fetch_add(1, Release);
+            wait(&self.inner.wait, self.inner.wait.load(Relaxed));
+            self.inner.counter.waiting.fetch_sub(1, Release);
         }
     }
 
@@ -171,15 +159,13 @@ impl<T> Receiver<T> {
             }
             drop(lock);
             // channel is closed
-            if self.inner.num_senders.load(Acquire) == 0 {
+            if self.inner.counter.senders.load(Acquire) == 0 {
                 return None;
             }
             // queue is empty
-            let wt = WaitingThread::new(num);
-            let mut lock = self.inner.queue.lock().unwrap();
-            lock.push_back(wt);
-            drop(lock);
-            std::thread::park();
+            self.inner.counter.waiting.fetch_add(1, Release);
+            wait(&self.inner.wait, self.inner.wait.load(Relaxed));
+            self.inner.counter.waiting.fetch_sub(1, Release);
         }
     }
 
@@ -190,15 +176,14 @@ impl<T> Receiver<T> {
             if !data.is_empty() {
                 let data = Vec::from_iter(data.into_iter());
                 return Some(data);
-            } else if self.inner.num_senders.load(Acquire) == 0 {
+            } else if self.inner.counter.senders.load(Acquire) == 0 {
                 return None;
             }
-            // wait for messages
-            let wt = WaitingThread::new(usize::MAX);
-            let mut lock = self.inner.queue.lock().unwrap();
-            lock.push_back(wt);
             drop(lock);
-            std::thread::park();
+            // wait for messages
+            self.inner.counter.waiting.fetch_add(1, Release);
+            wait(&self.inner.wait, self.inner.wait.load(Relaxed));
+            self.inner.counter.waiting.fetch_sub(1, Release);
         }
     }
 }
